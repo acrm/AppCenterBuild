@@ -1,4 +1,6 @@
-﻿
+﻿/// <summary>
+/// Code from https://dusted.codes/dotenv-in-dotnet
+/// </summary>
 namespace AppCenterBuild.Utils
 {
     public static class DotEnvLoader
