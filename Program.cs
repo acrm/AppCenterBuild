@@ -1,125 +1,97 @@
-﻿using AppCenterBuild.Model.Branches;
+﻿using AppCenterBuild.Model;
+using AppCenterBuild.Model.Branches;
+using AppCenterBuild.Model.Builds;
 using AppCenterBuild.Utils;
-using Microsoft.Extensions.Configuration;
 using System.Net.Http.Json;
-using System.Text.Json;
 
-IConfigurationRoot GetConfig()
-{
-    var root = Directory.GetCurrentDirectory();
-    var dotenv = Path.Combine(root, ".env");
-    DotEnvLoader.Load(dotenv);
-
-    var config = new ConfigurationBuilder()
-        .AddEnvironmentVariables()
-        .Build();
-    return config;
-}
-
-var config = GetConfig();
+var config = Helper.GetConfig();
 var apiToken = config["ApiToken"];
-var user = config["UserName"];
-var app = config["AppName"];
+var userName = config["UserName"];
+var appName = config["AppName"];
+var buildCheckSeconds = int.Parse(config["BuildCheckSeconds"]);
 
 using var httpClient = new HttpClient();
-httpClient.BaseAddress = new Uri($"https://api.appcenter.ms/v0.1/apps/{user}/{app}/");
+httpClient.BaseAddress = new Uri($"https://api.appcenter.ms/v0.1/apps/{userName}/{appName}/");
 httpClient.DefaultRequestHeaders.Add("X-API-Token", apiToken);
 
-var branchListItems = await httpClient.GetFromJsonAsync<BranchListItemDto[]>("branches");
-if (branchListItems == null) return;
+Func<Task<BranchListItemDto[]>> getBranchesAsync = async () => (await httpClient.GetFromJsonAsync<BranchListItemDto[]>("branches")) ?? Array.Empty<BranchListItemDto>();
 
-foreach (var item in branchListItems)
-{
-    Console.WriteLine($"{item.Branch?.Name}, {item.Branch?.Commit?.Sha}");
-}
-
-//var buildStartTasks = branchListItems
-//    .Select(item => httpClient.PostAsJsonAsync<BranchBuildRequestParams?>(
-//        $"branches/{item.Branch?.Name}/builds",
-//        new BranchBuildRequestParams { SourceVersion = item.Branch?.Commit?.Sha },
-//        CancellationToken.None))
-//    .ToArray();
-
-//Task.WaitAll(buildStartTasks);
-
-var buildsInfoRequestTasks = branchListItems
-    .Select(branchItem =>
-    {
-        return httpClient
-            .GetFromJsonAsync<BranchBuildListItem[]>($"branches/{branchItem.Branch?.Name}/builds", CancellationToken.None)
-            .ContinueWith(previous =>
+Func<BranchDto, Task<BranchBuildPair>> getOrStartBuildAsync = branch =>
+    httpClient
+        .GetFromJsonAsync<BranchBuildListItem[]>($"branches/{branch.Name}/builds", CancellationToken.None)
+        .ContinueWith(previous =>
+        {
+            var currentVersionBuild = previous.Result?.FirstOrDefault(buildItem =>
+                buildItem.SourceVersion == branch?.Commit?.Sha
+                && buildItem.Result != "canceled"
+                && buildItem.Result != "failed");
+            if (currentVersionBuild != null)
             {
-                var currentVersionBuild = previous.Result?.FirstOrDefault(buildItem => buildItem.SourceVersion == branchItem.Branch?.Commit?.Sha);
-                return currentVersionBuild;
-            });
-    })
-    .ToArray();
-Task.WaitAll(buildsInfoRequestTasks);
+                return Task.FromResult(new BranchBuildPair(branch, (BranchBuildListItem?)currentVersionBuild));
+            }
 
-foreach (var task in buildsInfoRequestTasks.Where(task => task.Result != null))
+            return httpClient
+                .PostAsJsonAsync<BranchBuildRequestParams?>(
+                    $"branches/{branch.Name}/builds",
+                    new BranchBuildRequestParams { SourceVersion = branch.Commit?.Sha },
+                    CancellationToken.None)
+                .ContinueWith(previous => new BranchBuildPair(branch, currentVersionBuild));
+        })
+        .Unwrap();
+
+Func<BranchBuildPair[], Task<BranchBuildPair[]>> waitAllBuildsComplteteAsync = async branchBuildPairs =>
+    await Task.WhenAll(branchBuildPairs.Select(async pair =>
+    {
+        var branch = pair.Branch;
+        var build = pair.Build;
+        if (build == null || build.BuildNumber == null || build.FinishTime == null || build.StartTime == null || build.Status == "completed")
+        {
+            return pair;
+        }
+
+        return await Task.Run(async () =>
+        {
+            while (true) // todo: cancelation
+            {
+                var currentBuildInfo = await httpClient
+                    .GetFromJsonAsync<BranchBuildListItem>($"branches/{branch.Name}/builds/{build.Id}", CancellationToken.None);
+                if (currentBuildInfo != null && currentBuildInfo.Status == "completed")
+                {
+                    return new BranchBuildPair(branch, currentBuildInfo);
+                }
+
+                await Task.Delay(buildCheckSeconds * 1000);
+            }
+        });
+    }));
+
+Action<BranchBuildPair[]> printBuildsInfo = branchBuildPairs =>
 {
-    Console.WriteLine($"{task.Result.BuildNumber} {task.Result.LastChangedDate}");
-}
+    foreach (var (branch, build) in branchBuildPairs)
+    {
+        if (build == null || build.BuildNumber == null || build.FinishTime == null || build.StartTime == null)
+        {
+            Console.WriteLine($"{branch?.Name} no build information");
+            continue;
+        }
 
+        if (build.Status != "completed")
+        {
+            Console.WriteLine($"{branch?.Name} build in progress");
+            continue;
+        }
 
-public class BranchBuildListItem
-{
-    public int Id { get; set; }
+        var duration = Math.Ceiling((build.FinishTime - build.StartTime).Value.TotalSeconds);
+        var buildNumber = build.BuildNumber;
+        var slash = "%2F";
+        var link = $"https://appcenter.ms/download?url={slash}v0.1{slash}apps{slash}{userName}{slash}{appName}{slash}builds{slash}{buildNumber}{slash}downloads{slash}logs";
+        Console.WriteLine($"{branch?.Name} build {build?.Status} in {duration} seconds. Link to build logs {link}");
+    }
+};
 
-    public string? BuildNumber { get; set; }
-
-    public DateTime? QueueTime { get; set; }
-
-    public DateTime? StartTime { get; set; }
-
-    public DateTime? LastChangedDate { get; set; }
-
-    public string? Status { get; set; }
-
-    public string? Reason { get; set; }
-
-    public string? SourceBranch { get; set; }
-
-    public string? SourceVersion { get; set; }
-
-    public string[]? Tags { get; set; }
-}
-
-
-//var listBranchesRequest = new HttpRequestMessage(HttpMethod.Get, "branches");
-
-//var response = httpClient.Send(listBranchesRequest);
-//using var reader = new StreamReader(response.Content.ReadAsStream());
-//var responseBody = reader.ReadToEnd();
-
-//var data = JsonSerializer.Deserialize<BranchListItemDto[]>(responseBody, new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
-
-//var buildStartTasks = data
-//    .Select(item => httpClient.PostAsJsonAsync<BranchBuildRequestParams?>(
-//        $"branches/{item.Branch?.Name}/builds",
-//        new BranchBuildRequestParams { SourceVersion = item.Branch?.Commit?.Sha },
-//        CancellationToken.None))
-//    .ToArray();
-
-//Task.WaitAll(buildStartTasks);
-
-
-public class BranchBuildRequestParams
-{
-    public string? SourceVersion { get; set; }
-
-    public bool Debug { get; set; }
-}
-
-//foreach (var item in data)
-//{
-//    Console.WriteLine($"{item.Branch?.Name}, {item.Branch?.Commit?.Sha}");
-//    //var startBranchBuildRequest = new HttpRequestMessage(HttpMethod.Post, $"https://api.appcenter.ms/v0.1/apps/{user}/{app}/branches/main/builds");
-//    //startBranchBuildRequest.Headers.Add("X-API-Token", apiToken);
-//    //var startBranchBuildResponse = httpClient.Send(startBranchBuildRequest);
-//    //using var responseReader = new StreamReader(startBranchBuildResponse.Content.ReadAsStream());
-//    //var startBranchBuildResponseBody = responseReader.ReadToEnd();
-
-//    await 
-
-//}
+await Task.WhenAll(
+    (await getBranchesAsync())
+    .Select(branchItem => getOrStartBuildAsync(branchItem.Branch)))
+.ContinueWith(async previous => await waitAllBuildsComplteteAsync(previous.Result))
+.Unwrap()
+.ContinueWith(previous => printBuildsInfo(previous.Result));
